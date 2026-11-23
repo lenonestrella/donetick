@@ -7,22 +7,55 @@
 # The stock Dockerfile embeds whatever is in frontend/dist (a placeholder in
 # git); this one builds the frontend first and embeds the real bundle.
 
-# Stage 1: build the web frontend from the ./web submodule.
+# Stage 1: get the frontend source pinned by the ./web submodule.
+# Locally (submodule checked out) the build context already has it. Railway's
+# GitHub builds do not include submodule contents, so web/ arrives empty; then
+# we read the submodule's pinned commit from the backend commit being built
+# (RAILWAY_GIT_COMMIT_SHA) and fetch exactly that frontend commit.
+FROM alpine:3.22 AS frontend-src
+
+RUN apk --no-cache add git
+
+ARG RAILWAY_GIT_COMMIT_SHA
+ARG RAILWAY_GIT_REPO_OWNER=lenonestrella
+ARG RAILWAY_GIT_REPO_NAME=donetick
+
+COPY . /ctx
+
+RUN set -e; \
+    if [ -f /ctx/web/package.json ]; then \
+      echo "frontend: using web/ from the build context"; \
+      cp -r /ctx/web /web; \
+    else \
+      if [ -z "$RAILWAY_GIT_COMMIT_SHA" ]; then \
+        echo "web/ is empty: run 'git submodule update --init' before building"; exit 1; \
+      fi; \
+      BACKEND_URL="https://github.com/${RAILWAY_GIT_REPO_OWNER}/${RAILWAY_GIT_REPO_NAME}.git"; \
+      FRONTEND_URL=$(git config -f /ctx/.gitmodules submodule.web.url); \
+      git init -q /backend; \
+      git -C /backend fetch -q --depth 1 --filter=blob:none "$BACKEND_URL" "$RAILWAY_GIT_COMMIT_SHA"; \
+      FRONTEND_SHA=$(git -C /backend ls-tree FETCH_HEAD web | awk '{print $3}'); \
+      echo "frontend: fetching ${FRONTEND_URL} at ${FRONTEND_SHA}"; \
+      git init -q /web; \
+      git -C /web fetch -q --depth 1 "$FRONTEND_URL" "$FRONTEND_SHA"; \
+      git -C /web checkout -q FETCH_HEAD; \
+    fi; \
+    rm -rf /web/.git /web/node_modules /web/dist /web/android /web/ios
+
+# Stage 2: build the web frontend.
 FROM node:20-alpine AS frontend
 
 WORKDIR /web
 
-# If this COPY fails with "not found", the submodule is not checked out:
-# run `git submodule update --init`.
-COPY web/package.json web/package-lock.json ./
-COPY web/patches ./patches
+COPY --from=frontend-src /web/package.json /web/package-lock.json ./
+COPY --from=frontend-src /web/patches ./patches
 RUN npm ci --no-audit --no-fund
 
-COPY web/ ./
+COPY --from=frontend-src /web/ ./
 # --mode selfhosted reads web/.env.selfhosted: same-origin API, no social login.
 RUN npx vite build --mode selfhosted
 
-# Stage 2: build the Go binary with the frontend embedded.
+# Stage 3: build the Go binary with the frontend embedded.
 FROM golang:1.24-alpine AS builder
 
 WORKDIR /usr/src/app
@@ -45,7 +78,7 @@ RUN BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
       -X donetick.com/core/config.BuildDate=${BUILD_DATE}" \
       -buildvcs=false -o /donetick .
 
-# Stage 3: runtime.
+# Stage 4: runtime.
 FROM alpine:3.22
 
 RUN apk --no-cache add ca-certificates libc6-compat tzdata
