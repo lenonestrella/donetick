@@ -1,0 +1,13 @@
+.git
+**/.git
+*.db
+data/
+uploads/
+web/node_modules
+web/dist
+web/android
+web/ios
+web/e2e
+web/tests
+web/fastlane
+web/brag-output
