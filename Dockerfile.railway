@@ -1,0 +1,102 @@
+# Full Donetick image (API + web UI) built from this repo and the frontend
+# submodule in ./web. Used by Railway (see railway.json); also works locally:
+#
+#   git submodule update --init
+#   docker build -f Dockerfile.railway -t donetick .
+#
+# The stock Dockerfile embeds whatever is in frontend/dist (a placeholder in
+# git); this one builds the frontend first and embeds the real bundle.
+
+# Stage 1: get the frontend source pinned by the ./web submodule.
+# Locally (submodule checked out) the build context already has it. Railway's
+# GitHub builds do not include submodule contents, so web/ arrives empty; then
+# we read the submodule's pinned commit from the backend commit being built
+# (RAILWAY_GIT_COMMIT_SHA) and fetch exactly that frontend commit.
+FROM alpine:3.22 AS frontend-src
+
+RUN apk --no-cache add git
+
+ARG RAILWAY_GIT_COMMIT_SHA
+ARG RAILWAY_GIT_REPO_OWNER=lenonestrella
+ARG RAILWAY_GIT_REPO_NAME=donetick
+
+COPY . /ctx
+
+RUN set -e; \
+    if [ -f /ctx/web/package.json ]; then \
+      echo "frontend: using web/ from the build context"; \
+      cp -r /ctx/web /web; \
+    else \
+      if [ -z "$RAILWAY_GIT_COMMIT_SHA" ]; then \
+        echo "web/ is empty: run 'git submodule update --init' before building"; exit 1; \
+      fi; \
+      BACKEND_URL="https://github.com/${RAILWAY_GIT_REPO_OWNER}/${RAILWAY_GIT_REPO_NAME}.git"; \
+      FRONTEND_URL=$(git config -f /ctx/.gitmodules submodule.web.url); \
+      git init -q /backend; \
+      git -C /backend fetch -q --depth 1 --filter=blob:none "$BACKEND_URL" "$RAILWAY_GIT_COMMIT_SHA"; \
+      FRONTEND_SHA=$(git -C /backend ls-tree FETCH_HEAD web | awk '{print $3}'); \
+      echo "frontend: fetching ${FRONTEND_URL} at ${FRONTEND_SHA}"; \
+      git init -q /web; \
+      git -C /web fetch -q --depth 1 "$FRONTEND_URL" "$FRONTEND_SHA"; \
+      git -C /web checkout -q FETCH_HEAD; \
+    fi; \
+    rm -rf /web/.git /web/node_modules /web/dist /web/android /web/ios
+
+# Stage 2: build the web frontend.
+FROM node:20-alpine AS frontend
+
+WORKDIR /web
+
+COPY --from=frontend-src /web/package.json /web/package-lock.json ./
+COPY --from=frontend-src /web/patches ./patches
+RUN npm ci --no-audit --no-fund
+
+COPY --from=frontend-src /web/ ./
+# --mode selfhosted reads web/.env.selfhosted: same-origin API, no social login.
+RUN npx vite build --mode selfhosted
+
+# Stage 3: build the Go binary with the frontend embedded.
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /usr/src/app
+
+RUN apk --no-cache add ca-certificates tzdata
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+RUN rm -rf ./frontend/dist
+COPY --from=frontend /web/dist ./frontend/dist
+
+ARG VERSION=dev
+ARG COMMIT=dev
+RUN BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
+    CGO_ENABLED=0 go build -ldflags="-s -w \
+      -X donetick.com/core/config.Version=${VERSION} \
+      -X donetick.com/core/config.Commit=${COMMIT} \
+      -X donetick.com/core/config.BuildDate=${BUILD_DATE}" \
+      -buildvcs=false -o /donetick .
+
+# Stage 4: runtime.
+FROM alpine:3.22
+
+RUN apk --no-cache add ca-certificates libc6-compat tzdata
+
+COPY --from=builder /donetick /donetick
+COPY --from=builder /usr/src/app/config /config
+
+# Persistent data lives on a volume mounted at /data (Railway volume).
+ENV DT_ENV="selfhosted" \
+    DT_SQLITE_PATH="/data/donetick.db" \
+    DT_STORAGE_BASE_PATH="/data/uploads" \
+    DT_SERVER_PORT="2021"
+
+RUN mkdir -p /data/uploads
+
+EXPOSE 2021
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget --quiet --tries=1 --spider http://localhost:2021/api/v1/health || exit 1
+
+CMD ["/donetick"]
